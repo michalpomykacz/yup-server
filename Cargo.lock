@@ -1229,6 +1229,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "serde",
+ "serde_json",
  "tokio",
  "tower",
  "tracing",

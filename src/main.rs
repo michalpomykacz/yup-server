@@ -1,10 +1,3 @@
-//! Example chat application.
-//!
-//! Run with
-//!
-//! ```not_rust
-//! cargo run -p example-chat
-//! ```
 
 use axum::{
     extract::{
@@ -18,18 +11,32 @@ use axum::{
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    collections::HashMap,
+    sync::Arc,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use serde_json::Value;
+use serde::Deserialize;
+
+
+#[derive(Deserialize, Clone, Default)]
+struct LoginMessage {
+    username: String,
+    group: String,
+}
+
+#[derive(Deserialize)]
+struct TextMessage {
+    text: String,
+}
+
 
 // Our shared state
 struct AppState {
     // We require unique usernames. This tracks which usernames have been taken.
-    user_set: Mutex<HashSet<String>>,
+    user_set: Mutex<HashMap<String, HashSet<String>>>,
+    group_channels: Mutex<HashMap<String, broadcast::Sender<String>>>,
     // Channel used to send messages to all connected clients.
-    tx: broadcast::Sender<String>,
 }
 
 #[tokio::main]
@@ -43,10 +50,10 @@ async fn main() {
         .init();
 
     // Set up application state for use with with_state().
-    let user_set = Mutex::new(HashSet::new());
-    let (tx, _rx) = broadcast::channel(100);
+    let user_set = Mutex::new(HashMap::new());
+    let group_channels = Mutex::new(HashMap::new());
 
-    let app_state = Arc::new(AppState { user_set, tx });
+    let app_state = Arc::new(AppState { user_set, group_channels });
 
     let app = Router::new()
         .route("/", get(index))
@@ -75,35 +82,38 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     let (mut sender, mut receiver) = stream.split();
 
     // Username gets set in the receive loop, if it's valid.
-    let mut username = String::new();
+    let mut login_message: LoginMessage = Default::default();
     // Loop until a text message is found.
     while let Some(Ok(message)) = receiver.next().await {
-        if let Message::Text(name) = message {
-            // If username that is sent by client is not taken, fill username string.
-            check_username(&state, &mut username, &name);
-
-            // If not empty we want to quit the loop else we want to quit function.
-            if !username.is_empty() {
+        if let Message::Text(text) = message {
+            let text_str = text.as_str();
+            login_message = serde_json::from_str::<LoginMessage>(&text_str).unwrap();
+            if check_username(&state, &login_message).await.is_ok() {
                 break;
             } else {
-                // Only send our client that username is taken.
                 let _ = sender
                     .send(Message::Text(String::from("Username already taken.")))
                     .await;
-
                 return;
             }
         }
     }
 
-    // We subscribe *before* sending the "joined" message, so that we will also
-    // display it to our client.
-    let mut rx = state.tx.subscribe();
 
-    // Now send the "joined" message to all subscribers.
-    let msg = format!("{username} joined.");
+    let mut group_channels = state.group_channels.lock().await;
+    let tx = group_channels.entry(login_message.group.clone()).or_insert_with(|| {
+        let (tx, _rx) = broadcast::channel(100);
+        tx
+    }).clone();
+    std::mem::drop(group_channels);
+
+    let mut rx = tx.subscribe();
+
+    let msg = format!("{} joined group {}.", login_message.username, login_message.group);
     tracing::debug!("{msg}");
-    let _ = state.tx.send(msg);
+    let _ = tx.send(msg);
+
+    let tx_clone = tx.clone(); // Clone tx for use in recv_task
 
     // Spawn the first task that will receive broadcast messages and send text
     // messages over the websocket to our client.
@@ -117,15 +127,18 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     });
 
     // Clone things we want to pass (move) to the receiving task.
-    let tx = state.tx.clone();
-    let name = username.clone();
+    let username = login_message.username.clone();
+    let group_clone = login_message.group.clone();
 
     // Spawn a task that takes messages from the websocket, prepends the user
     // name, and sends them to all broadcast subscribers.
     let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            // Add username before message.
-            let _ = tx.send(format!("{name}: {text}"));
+        while let Some(Ok(message)) = receiver.next().await {
+            if let Message::Text(text) = message {
+                if let Ok(text_message) = serde_json::from_str::<TextMessage>(&text) {
+                    let _ = tx_clone.send(format!("{} (group {}): {}", &login_message.username, &login_message.group, text_message.text));
+                }
+            }
         }
     });
 
@@ -136,21 +149,32 @@ async fn websocket(stream: WebSocket, state: Arc<AppState>) {
     };
 
     // Send "user left" message (similar to "joined" above).
-    let msg = format!("{username} left.");
+    let msg = format!("{} left group {}.", &username, &group_clone);
     tracing::debug!("{msg}");
-    let _ = state.tx.send(msg);
+    let _ = tx.send(msg);
 
     // Remove username from map so new clients can take it again.
-    state.user_set.lock().unwrap().remove(&username);
+    state.user_set.lock().await.get_mut(&group_clone).unwrap().remove(&username);
 }
 
-fn check_username(state: &AppState, string: &mut String, name: &str) {
-    let mut user_set = state.user_set.lock().unwrap();
+async fn check_username(state: &AppState, login_message: &LoginMessage) -> Result<(), ()> {
+    let mut user_set = state.user_set.lock().await;
 
-    if !user_set.contains(name) {
-        user_set.insert(name.to_owned());
-
-        string.push_str(name);
+    // Check if the group exists in the user_set
+    if let Some(users) = user_set.get_mut(&login_message.group) {
+        // Check if the username is already taken in the group
+        if !users.contains(&login_message.username) {
+            users.insert(login_message.username.to_owned());
+            Ok(())
+        } else {
+            Err(())
+        }
+    } else {
+        // If the group does not exist, create a new entry for the group
+        let mut users = HashSet::new();
+        users.insert(login_message.username.to_owned());
+        user_set.insert(login_message.group.to_owned(), users);
+        Ok(())
     }
 }
 

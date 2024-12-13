@@ -34,7 +34,7 @@
 
         websocket.onopen = function() {
             console.log("connection opened");
-            websocket.send({type: "login", username: username.value, group: group.value});
+            websocket.send(JSON.stringify({username: username.value, group: group.value}));
         }
 
         const btn = this;
@@ -51,7 +51,7 @@
 
         input.onkeydown = function(e) {
             if (e.key == "Enter") {
-                websocket.send({type: "message", message: input.value});
+                websocket.send(JSON.stringify({text: input.value}));
                 input.value = "";
             }
         }
